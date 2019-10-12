@@ -1,0 +1,20 @@
+[package]
+name = "network_sim"
+version = "0.1.0"
+authors = ["Karl Bergström <karl.anton.bergstrom@gmail.com>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+amethyst = { path = "../amethyst_network_rewrite", features = [ "vulkan", "nightly", "network-monkey" ] }
+log = { version = "0.4.6", features = ["serde"] }
+serde = { version = "1", features = ["derive"] } 
+bincode = { version = "1.2" } 
+amethyst-imgui = { path = "../amethyst-imgui" }
+lazy_static = "1.4"
+bytes = "0.4" 
+splines = {version = "2.1", features = ["impl-nalgebra"] }
+
+[patch.crates-io]
+amethyst = { path = "../amethyst_network_rewrite" }
