@@ -70,7 +70,7 @@ impl SimpleState for RenderState {
         // Setup debug lines as a resource
         data.world.insert(DebugLines::new());
         // Configure width of lines. Optional step
-        data.world.insert(DebugLinesParams { line_width: 20.0 });
+        data.world.insert(DebugLinesParams { line_width: 1.0 });
 
         // Setup debug lines as a component and add lines to render axis&grid
         // let mut debug_lines_component = DebugLinesComponent::new();

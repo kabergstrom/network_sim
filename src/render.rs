@@ -102,10 +102,16 @@ impl<'s> amethyst::ecs::System<'s> for SimRenderSystem {
                 ),
                 SimSide::Client => (
                     Point3::new(pos.x + screen_w * 0.5, pos.y + screen_h * 0.02, 0.0),
-                    Srgba::new(0.7, 0.3, 0.3, 1.0),
+                    Srgba::new(0.5, 1.0, 0.5, 1.0),
                 ),
             };
-            lines.draw_circle(pos, 1.0, 2, color);
+            let mut line_color = color;
+            if settings.playing {
+                line_color.alpha = 0.15;
+            }
+            lines.draw_circle(pos, 15.0, 30, line_color);
+            lines.draw_circle(pos, 10.0, 20, line_color);
+            lines.draw_circle(pos, 5.0, 10, line_color);
             if frame.render_time <= settings.curr_time {
                 match frame.side {
                     SimSide::Server => server_pos_color = Some((pos, color)),
@@ -113,11 +119,21 @@ impl<'s> amethyst::ecs::System<'s> for SimRenderSystem {
                 }
             }
         }
-        if let Some((pos, color)) = server_pos_color {
-            lines.draw_circle(pos, 5.0, 10, color);
-        }
-        if let Some((pos, color)) = client_pos_color {
-            lines.draw_circle(pos, 5.0, 10, color);
+        if settings.playing || settings.curr_time != 0. {
+            if settings.curr_time <= settings.duration {
+                if let Some((pos, color)) = server_pos_color {
+                    lines.draw_circle(pos, 5.0, 10, color);
+                    lines.draw_circle(pos, 10.0, 10, color);
+                    lines.draw_circle(pos, 20.0, 10, color);
+                    lines.draw_circle(pos, 30.0, 20, color);
+                }
+            }
+            if let Some((pos, color)) = client_pos_color {
+                lines.draw_circle(pos, 5.0, 10, color);
+                lines.draw_circle(pos, 10.0, 10, color);
+                lines.draw_circle(pos, 20.0, 10, color);
+                lines.draw_circle(pos, 30.0, 20, color);
+            }
         }
     }
 }

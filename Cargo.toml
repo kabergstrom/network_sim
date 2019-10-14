@@ -15,6 +15,7 @@ amethyst-imgui = { path = "../amethyst-imgui" }
 lazy_static = "1.4"
 bytes = "0.4" 
 splines = {version = "2.1", features = ["impl-nalgebra"] }
+rand = { version = "0.7.2", features = [ "small_rng" ] }
 
 [patch.crates-io]
 amethyst = { path = "../amethyst_network_rewrite" }

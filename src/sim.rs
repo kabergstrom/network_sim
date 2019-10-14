@@ -5,7 +5,7 @@ use amethyst::{
         math::{self, Vector2},
         SystemDesc, Time,
     },
-    ecs::{Read, System, World, Write, WriteExpect},
+    ecs::{Read, ReadExpect, System, World, Write, WriteExpect},
     network::simulation::{
         memory::{channel as memory_channel, MemoryNetworkBundle},
         NetworkSimulationEvent, NetworkSimulationTime, TransportResource,
@@ -20,6 +20,54 @@ use std::{
     fmt::{self, Debug},
     sync::{Arc, Mutex},
 };
+
+#[derive(Debug)]
+pub enum SimSide {
+    Client,
+    Server,
+}
+#[derive(Debug)]
+pub struct WorldFrame<M: Debug + Clone> {
+    pub side: SimSide,
+    pub render_time: f32,
+    pub net_time: f32,
+    pub sample: M,
+}
+#[derive(Clone)]
+pub struct SimSettings {
+    pub curr_time: f32,
+    pub sim_time_scale: f32,
+    pub server_fps: u32,
+    pub sync_rate: u32,
+    pub render_fps: u32,
+    pub render_time_variance: f32,
+    pub duration: f32,
+    pub render_interpolation_delay: f32,
+    pub min_latency: f32,
+    pub max_latency: f32,
+    pub loss_percentage: f32,
+    pub playing: bool,
+    pub behaviour: Arc<dyn SimulationBehaviour>,
+}
+impl Default for SimSettings {
+    fn default() -> Self {
+        Self {
+            curr_time: 0.0,
+            sim_time_scale: 1.0,
+            render_fps: 60,
+            sync_rate: 30,
+            server_fps: 30,
+            duration: 0.5,
+            render_interpolation_delay: 0.,
+            render_time_variance: 0.,
+            min_latency: 0.,
+            max_latency: 0.,
+            loss_percentage: 0.,
+            playing: false,
+            behaviour: Arc::new(crate::sim_behaviours::SineWaveThinClientCreator::default()),
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 struct LocalClock {
@@ -143,19 +191,19 @@ pub trait SimulationBehaviour: fmt::Display + Send + Sync + std::any::Any {
 pub trait AsymmetricSimulationState {
     type SyncType: Serialize + for<'de> Deserialize<'de>;
     fn update_server(&mut self, time: &Time) -> Sample;
-    fn send_state(&mut self) -> &Self::SyncType;
-    fn recv_state(&mut self, val: Self::SyncType);
-    fn send_sync(&mut self, _time: &Time) -> Vec<u8> {
+    fn send_state(&self) -> &Self::SyncType;
+    fn recv_state(&mut self, val: Self::SyncType, time: &Time);
+    fn send_sync(&self, _time: &Time) -> Vec<u8> {
         bincode::serialize(&self.send_state()).unwrap()
     }
     fn recv_sync(
         &mut self,
-        _time: &Time,
+        time: &Time,
         _server_time: Duration,
         _server_frame: u64,
         msg: &Vec<u8>,
     ) {
-        self.recv_state(bincode::deserialize(msg).unwrap());
+        self.recv_state(bincode::deserialize(msg).unwrap(), time);
     }
     fn update_render(&mut self, time: &Time) -> Option<Sample>;
 }
@@ -163,7 +211,7 @@ impl<T: AsymmetricSimulationState + Send + Sync + 'static> SimulationState for T
     fn update_server(&mut self, time: &Time) -> Sample {
         <Self as AsymmetricSimulationState>::update_server(self, time)
     }
-    fn send_sync(&mut self, time: &Time) -> Vec<u8> {
+    fn send_sync(&self, time: &Time) -> Vec<u8> {
         <Self as AsymmetricSimulationState>::send_sync(self, time)
     }
     fn recv_sync(&mut self, time: &Time, server_time: Duration, server_frame: u64, msg: &Vec<u8>) {
@@ -176,7 +224,7 @@ impl<T: AsymmetricSimulationState + Send + Sync + 'static> SimulationState for T
 
 pub trait SimulationState: Send + Sync + std::any::Any {
     fn update_server(&mut self, time: &Time) -> Sample;
-    fn send_sync(&mut self, time: &Time) -> Vec<u8>;
+    fn send_sync(&self, time: &Time) -> Vec<u8>;
     fn recv_sync(&mut self, time: &Time, server_time: Duration, server_frame: u64, msg: &Vec<u8>);
     fn update_render(&mut self, time: &Time) -> Option<Sample>;
 }
@@ -187,7 +235,7 @@ pub struct ServerRateSimulation<T> {
 }
 impl<T: fmt::Display + Default> fmt::Display for ServerRateSimulation<T> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "Fixed Update {}", T::default())
+        write!(f, "{}", T::default())
     }
 }
 impl<T: DeterministicSimulation + fmt::Display> SimulationBehaviour for ServerRateSimulation<T> {
@@ -199,42 +247,33 @@ impl<T: DeterministicSimulation + fmt::Display> SimulationBehaviour for ServerRa
             prev_pos: math::zero(),
             client_sim: T::default(),
             last_server_frame: None,
+            render_delay: settings.render_interpolation_delay,
             server: T::initial(settings),
         })
     }
 }
 #[derive(Clone)]
 pub struct ServerRateSimulationState<T: DeterministicSimulation> {
-    interpolation_buffer: splines::Spline<f32, T>,
+    interpolation_buffer: splines::Spline<f32, T::SyncType>,
     prev_pos: Vector2<f32>,
     clock: Option<LocalClock>,
     client_sim: T,
     server: T,
     last_server_frame: Option<u64>,
+    render_delay: f32,
     server_fps: u32,
 }
-impl<
-        T: DeterministicSimulation
-            + Serialize
-            + for<'de> Deserialize<'de>
-            + Clone
-            + Send
-            + Sync
-            + splines::Interpolate<f32>
-            + Debug
-            + 'static,
-    > SimulationState for ServerRateSimulationState<T>
-{
-    fn send_sync(&mut self, _time: &Time) -> Vec<u8> {
-        bincode::serialize(&self.server).unwrap()
+impl<T: DeterministicSimulation> SimulationState for ServerRateSimulationState<T> {
+    fn send_sync(&self, _time: &Time) -> Vec<u8> {
+        bincode::serialize(self.server.send_state()).unwrap()
     }
     fn recv_sync(&mut self, time: &Time, server_time: Duration, server_frame: u64, msg: &Vec<u8>) {
         // start a new local clock that started server_time in the past
         if let None = self.clock {
-            self.server = bincode::deserialize(msg).unwrap();
-            let offset_secs = server_time.as_secs() as i64 - time.absolute_time().as_secs() as i64;
-            let offset_nanos =
-                server_time.as_nanos() as i32 - time.absolute_time().as_nanos() as i32;
+            self.server.recv_state(bincode::deserialize(msg).unwrap());
+            let diff = time.absolute_time() - server_time;
+            let offset_secs = -(diff.as_secs() as i64);
+            let offset_nanos = -(diff.as_nanos() as i32);
             let mut clock = LocalClock::new(
                 offset_secs,
                 offset_nanos,
@@ -247,26 +286,25 @@ impl<
             let t = clock.absolute_time.as_secs_f32();
             self.interpolation_buffer.add(splines::Key::new(
                 t,
-                self.server,
+                self.server.send_state().clone(),
                 splines::Interpolation::Linear,
             ));
             self.clock = Some(clock);
-            self.client_sim = self.server.clone();
+            self.client_sim.clone_from(&self.server);
         } else if let Some(clock) = self.clock.as_mut() {
-            println!("client {:?} server {:?}", clock.absolute_time, server_time);
             // check if the incoming packet happened after our last received packet
             let newer_snapshot = self
                 .last_server_frame
                 .map(|f| f < server_frame)
                 .unwrap_or(true);
 
-            let new_snapshot = bincode::deserialize(msg).unwrap();
             if newer_snapshot {
                 if server_frame < clock.frame_number {
                     self.last_server_frame = None;
                     clock.frame_number = server_frame;
                     clock.absolute_time = server_time;
-                    self.client_sim = new_snapshot;
+                    self.client_sim
+                        .recv_state(bincode::deserialize(msg).unwrap());
                     for i in (0..self.interpolation_buffer.len()).rev() {
                         if self
                             .interpolation_buffer
@@ -277,25 +315,14 @@ impl<
                             self.interpolation_buffer.remove(i);
                         }
                     }
-                    println!(
-                        "received snapshot that happened at frame {} but we are at {}",
-                        server_frame, clock.frame_number
-                    );
                 } else {
                     self.last_server_frame = Some(server_frame);
-                    self.server = new_snapshot;
+                    self.server.recv_state(bincode::deserialize(msg).unwrap());
                 }
             } else {
                 // ignore reordered message
             }
         }
-        println!(
-            "client {:?} {:?} server {:?} {:?}",
-            self.client_sim,
-            self.clock.unwrap().absolute_time,
-            &self.server,
-            server_time,
-        );
     }
     fn update_render(&mut self, time: &Time) -> Option<Sample> {
         if let Some(clock) = self.clock.as_mut() {
@@ -305,10 +332,6 @@ impl<
                     .time_per_frame
                     .unwrap()
                     .mul_f32((clock.frame_number - (clock.frames_since_tick - i)) as f32);
-                println!(
-                    "simulating frame {} at time {:?} total frames {} total time {:?}",
-                    i, frame_time, clock.frame_number, clock.absolute_time
-                );
                 // if this frame is the frame of our buffered server sample, just use the sample since
                 // this frame's authoritative simulation result has already been calculated.
                 // Otherwise perform a client-side simulation update
@@ -317,21 +340,15 @@ impl<
                     .map(|f| f == (clock.frame_number - (clock.frames_since_tick - i)))
                     .unwrap_or(false)
                 {
-                    println!(
-                        "use server frame {:?} for client frame {}",
-                        self.last_server_frame, clock.frame_number
-                    );
                     self.last_server_frame = None;
-                    self.client_sim = self.server.clone();
+                    self.client_sim.clone_from(&self.server);
                 } else {
                     self.client_sim.update(frame_time, clock.delta_time);
-                    println!("update {:?} {:?}", frame_time, self.client_sim);
                 }
                 let t = frame_time.as_secs_f32();
-                println!(" new key {:?} {:?}", t, self.client_sim);
                 self.interpolation_buffer.add(splines::Key::new(
                     t,
-                    self.client_sim,
+                    self.client_sim.send_state().clone(),
                     splines::Interpolation::Linear,
                 ));
             }
@@ -342,9 +359,12 @@ impl<
                     (-clock.clock_offset_nanos) as u32,
                 ))
             .as_secs_f32()
-                - clock.time_per_frame.unwrap().as_secs_f32();
-            let pos = self.interpolation_buffer.sample(t).map(|x| x.pos_sample());
-            println!("t: {:?} val: {:?} ", t, self.client_sim);
+                - clock.time_per_frame.unwrap().as_secs_f32()
+                - (self.render_delay / 1000.);
+            let pos = self
+                .interpolation_buffer
+                .sample(t)
+                .map(|x| self.client_sim.pos_sample(&x));
             pos
         } else {
             None
@@ -352,22 +372,21 @@ impl<
     }
     fn update_server(&mut self, time: &Time) -> Sample {
         self.server.update(time.absolute_time(), time.delta_time());
-        self.server.pos_sample()
+        self.server.pos_sample(self.server.send_state())
     }
 }
 
-pub trait DeterministicSimulation:
-    fmt::Debug
-    + splines::Interpolate<f32>
-    + Serialize
-    + for<'de> Deserialize<'de>
-    + Default
-    + Send
-    + Sync
-    + 'static
-{
+pub trait DeterministicSimulation: fmt::Debug + Default + Send + Sync + Clone + 'static {
+    type SyncType: Serialize
+        + for<'de> Deserialize<'de>
+        + splines::Interpolate<f32>
+        + Send
+        + Sync
+        + Clone;
+    fn send_state(&self) -> &Self::SyncType;
+    fn recv_state(&mut self, val: Self::SyncType);
     fn update(&mut self, abs_time: Duration, delta_time: Duration);
-    fn pos_sample(&self) -> Sample;
+    fn pos_sample(&self, val: &Self::SyncType) -> Sample;
     fn initial(settings: &SimSettings) -> Self;
 }
 
@@ -378,52 +397,6 @@ pub fn behaviour_data<T: SimulationBehaviour + Default + std::fmt::Display>(
         std::ffi::CString::new(format!("{}", T::default())).unwrap(),
     )
 }
-#[derive(Debug)]
-pub enum SimSide {
-    Client,
-    Server,
-}
-#[derive(Debug)]
-pub struct WorldFrame<M: Debug + Clone> {
-    pub side: SimSide,
-    pub render_time: f32,
-    pub net_time: f32,
-    pub sample: M,
-}
-#[derive(Clone)]
-pub struct SimSettings {
-    pub curr_time: f32,
-    pub sim_time_scale: f32,
-    pub server_fps: u32,
-    pub sync_rate: u32,
-    pub client_fps: u32,
-    pub seconds: f32,
-    pub client_delay: f32,
-    pub min_latency: f32,
-    pub max_latency: f32,
-    pub loss_percentage: f32,
-    pub playing: bool,
-    pub behaviour: Arc<dyn SimulationBehaviour>,
-}
-impl Default for SimSettings {
-    fn default() -> Self {
-        Self {
-            curr_time: 0.0,
-            sim_time_scale: 1.0,
-            client_fps: 240,
-            sync_rate: 30,
-            server_fps: 30,
-            seconds: 0.5,
-            client_delay: 0.,
-            min_latency: 0.,
-            max_latency: 0.,
-            loss_percentage: 0.,
-            playing: false,
-            behaviour: Arc::new(crate::sim_behaviours::SineWaveIntegrationState::default()),
-        }
-    }
-}
-
 impl<M: Debug + Clone + fmt::Display> fmt::Display for WorldFrame<M> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(
@@ -467,6 +440,8 @@ pub fn run_simulation(settings: &SimSettings) -> Result<SimulationResult<Sample>
             Application::build(assets_dir.clone(), ClientState::default())?.build(client_data)?;
         server_app.initialize();
         client_app.initialize();
+        server_app.world.insert(settings.clone());
+        client_app.world.insert(settings.clone());
         server_app
             .world
             .insert(settings.behaviour.new_state(&settings));
@@ -495,15 +470,24 @@ pub fn run_simulation(settings: &SimSettings) -> Result<SimulationResult<Sample>
             .get_mut::<TransportResource>()
             .unwrap()
             .set_monkey(Some(server_monkey));
-        let mut server_time = settings.seconds;
-        let mut client_time = settings.seconds;
-        while server_time > 0. && client_time > 0. {
-            if server_time >= client_time {
+        use rand::{Rng, SeedableRng};
+        let mut rng = rand::rngs::SmallRng::from_seed([0; 16]);
+        let extended_client_duration =
+            (settings.render_interpolation_delay + settings.min_latency) / 1000.;
+        let mut server_time = settings.duration + extended_client_duration;
+        let mut client_time = settings.duration + extended_client_duration;
+        while server_time > 0. || client_time > 0. {
+            if server_time >= client_time && server_time > 0. {
                 let server_delta = 1 as f32 / settings.server_fps as f32;
                 server_time -= server_delta;
                 server_app.step(Duration::from_secs_f32(server_delta));
-            } else {
-                let client_delta = 1 as f32 / settings.client_fps as f32;
+            } else if client_time > 0. {
+                let render_time_variance = {
+                    let deviation = (settings.render_time_variance / 1000.) * 0.5;
+                    rng.sample(rand::distributions::Normal::new(0., deviation as f64)) as f32
+                };
+                let mut client_delta = 1 as f32 / settings.render_fps as f32;
+                client_delta += render_time_variance;
                 client_time -= client_delta;
                 client_app.step(Duration::from_secs_f32(client_delta));
             }
@@ -541,9 +525,9 @@ impl<'a> System<'a> for ServerSimulationSystem {
         Write<'a, TransportResource>,
         WriteExpect<'a, Box<dyn SimulationState>>,
         WriteExpect<'a, Arc<Mutex<SimulationResult<Sample>>>>,
+        ReadExpect<'a, SimSettings>,
     );
-    fn run(&mut self, (net_time, time, mut transport, mut obj, sim): Self::SystemData) {
-        transport.update_monkey(&*time);
+    fn run(&mut self, (net_time, time, mut transport, mut obj, sim, settings): Self::SystemData) {
         let obj = &mut *obj;
         let sample = obj.update_server(&time);
         for _ in net_time.sim_frames_to_run() {
@@ -559,13 +543,16 @@ impl<'a> System<'a> for ServerSimulationSystem {
                 &bincode::serialize(&server_msg).unwrap(),
             );
         }
-        let mut sim = sim.lock().unwrap();
-        sim.frames.push(WorldFrame {
-            side: SimSide::Server,
-            render_time: time.absolute_time().as_secs_f32(),
-            net_time: (time.absolute_time() + net_time.elapsed_duration()).as_secs_f32(),
-            sample,
-        });
+        transport.update_monkey(&*time);
+        if time.absolute_time().as_secs_f32() <= settings.duration {
+            let mut sim = sim.lock().unwrap();
+            sim.frames.push(WorldFrame {
+                side: SimSide::Server,
+                render_time: time.absolute_time().as_secs_f32(),
+                net_time: (time.absolute_time() + net_time.elapsed_duration()).as_secs_f32(),
+                sample,
+            });
+        }
     }
 }
 pub struct ClientSimulationSystem {
